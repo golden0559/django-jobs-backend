@@ -1,0 +1,246 @@
+# matchmaking/models.py
+from django.db import models
+from django.core.validators import MinValueValidator, MaxValueValidator
+from accounts.models import Employee, Employer, Vacancy
+
+class MatchScore(models.Model):
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='matches')
+    employer = models.ForeignKey(Employer, on_delete=models.CASCADE, related_name='matches')
+    vacancy = models.ForeignKey(Vacancy, on_delete=models.CASCADE, related_name='matches')
+    score = models.IntegerField(
+        validators=[MinValueValidator(0), MaxValueValidator(100)]
+    )
+    analysis = models.TextField()  # Store OpenAI's analysis
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ('pending', 'Pending'),
+            ('accepted', 'Accepted'),
+            ('rejected', 'Rejected'),
+        ],
+        default='pending'
+    )
+
+    class Meta:
+        unique_together = ('employee', 'vacancy')
+        ordering = ['-score']
+
+class MatchPreference(models.Model):
+    employer = models.OneToOneField(Employer, on_delete=models.CASCADE)
+    min_experience = models.IntegerField(default=0)
+    preferred_skills = models.JSONField()
+    education_level = models.CharField(max_length=50)
+    location_preference = models.CharField(max_length=100)
+    remote_work = models.BooleanField(default=False)
+    salary_range = models.JSONField()  # Store min and max salary
+    
+    def __str__(self):
+        return f"Preferences for {self.employer.company_name}"
+
+# matchmaking/utils.py
+import openai
+from django.conf import settings
+from .models import MatchScore
+import json
+
+class MatchMaker:
+    def __init__(self):
+        openai.api_key = settings.OPENAI_API_KEY
+
+    def generate_match_prompt(self, employee, vacancy):
+        """Generate prompt for OpenAI analysis."""
+        return f"""
+        Analyze the job match and provide a score from 0 to 100 based on the following:
+
+        Job Requirements (Vacancy):
+        - Title: {vacancy.title}
+        - Required Skills: {vacancy.required_skills}
+        - Experience Level: {vacancy.experience_required} years
+        - Education Required: {vacancy.education_required}
+        - Location: {vacancy.location}
+        - Remote Work: {vacancy.remote_work}
+        - Salary Range: {vacancy.salary_range}
+
+        Candidate Profile:
+        - Skills: {employee.skills}
+        - Experience: {employee.experience} years
+        - Education: {employee.education}
+        - Location: {employee.city_name}
+        - Biography: {employee.biography}
+
+        Provide the response in the following JSON format:
+        {{
+            "score": [0-100],
+            "analysis": "detailed analysis of the match",
+            "key_matches": ["list of key matching points"],
+            "gaps": ["list of potential gaps or mismatches"]
+        }}
+        """
+
+    async def calculate_match_score(self, employee, vacancy):
+        """Calculate match score using OpenAI."""
+        try:
+            prompt = self.generate_match_prompt(employee, vacancy)
+            
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert HR analyst specializing in job matching."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
+
+            # Parse the JSON response
+            result = json.loads(response.choices[0].message.content)
+            
+            # Create or update match score
+            match_score, created = MatchScore.objects.update_or_create(
+                employee=employee,
+                vacancy=vacancy,
+                employer=vacancy.employer,
+                defaults={
+                    'score': result['score'],
+                    'analysis': json.dumps(result)
+                }
+            )
+
+            return match_score
+
+        except Exception as e:
+            print(f"Error calculating match score: {e}")
+            return None
+
+    async def batch_process_matches(self, employees, vacancies):
+        """Process matches for multiple employees and vacancies."""
+        results = []
+        for employee in employees:
+            for vacancy in vacancies:
+                match_score = await self.calculate_match_score(employee, vacancy)
+                if match_score:
+                    results.append(match_score)
+        return results
+
+    def get_top_matches_for_vacancy(self, vacancy, limit=10):
+        """Get top matching candidates for a vacancy."""
+        return MatchScore.objects.filter(
+            vacancy=vacancy,
+            status='pending'
+        ).order_by('-score')[:limit]
+
+    def get_top_matches_for_employee(self, employee, limit=10):
+        """Get top matching vacancies for a candidate."""
+        return MatchScore.objects.filter(
+            employee=employee,
+            status='pending'
+        ).order_by('-score')[:limit]
+
+# matchmaking/views.py
+from rest_framework import generics, status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from .models import MatchScore, MatchPreference
+from .utils import MatchMaker
+from .serializers import MatchScoreSerializer, MatchPreferenceSerializer
+from accounts.models import Employee, Employer
+from vacancies.models import Vacancy
+
+class CalculateMatchView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    async def post(self, request):
+        try:
+            employee_id = request.data.get('employee_id')
+            vacancy_id = request.data.get('vacancy_id')
+
+            employee = Employee.objects.get(id=employee_id)
+            vacancy = Vacancy.objects.get(id=vacancy_id)
+
+            matchmaker = MatchMaker()
+            match_score = await matchmaker.calculate_match_score(employee, vacancy)
+
+            if match_score:
+                serializer = MatchScoreSerializer(match_score)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            
+            return Response(
+                {"error": "Failed to calculate match score"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        except (Employee.DoesNotExist, Vacancy.DoesNotExist) as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class TopMatchesForVacancyView(generics.ListAPIView):
+    serializer_class = MatchScoreSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        vacancy_id = self.kwargs['vacancy_id']
+        matchmaker = MatchMaker()
+        return matchmaker.get_top_matches_for_vacancy(
+            vacancy_id,
+            limit=int(self.request.query_params.get('limit', 10))
+        )
+
+class TopMatchesForEmployeeView(generics.ListAPIView):
+    serializer_class = MatchScoreSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        employee_id = self.kwargs['employee_id']
+        matchmaker = MatchMaker()
+        return matchmaker.get_top_matches_for_employee(
+            employee_id,
+            limit=int(self.request.query_params.get('limit', 10))
+        )
+
+class UpdateMatchStatusView(generics.UpdateAPIView):
+    queryset = MatchScore.objects.all()
+    serializer_class = MatchScoreSerializer
+    permission_classes = [IsAuthenticated]
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.status = request.data.get('status', instance.status)
+        instance.save()
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+# matchmaking/serializers.py
+from rest_framework import serializers
+from .models import MatchScore, MatchPreference
+
+class MatchScoreSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.user.username', read_only=True)
+    employer_name = serializers.CharField(source='employer.company_name', read_only=True)
+    vacancy_title = serializers.CharField(source='vacancy.title', read_only=True)
+    analysis_dict = serializers.JSONField(source='analysis', read_only=True)
+
+    class Meta:
+        model = MatchScore
+        fields = [
+            'id', 'employee', 'employer', 'vacancy',
+            'employee_name', 'employer_name', 'vacancy_title',
+            'score', 'analysis_dict', 'status',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['score', 'analysis_dict', 'created_at', 'updated_at']
+
+class MatchPreferenceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MatchPreference
+        fields = '__all__'
+

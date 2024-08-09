@@ -1,0 +1,9 @@
+.env
+env
+.venv
+jobr_api_backend/db.sqlite3
+.idea
+venv
+__pycache__/
+my_secrets.py
+jobr_api_backend/static
